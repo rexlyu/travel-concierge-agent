@@ -1,0 +1,96 @@
+name: Travel Concierge CI & AgentOps Evaluation Gate
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  quality-and-eval-gate:
+    name: Lint, Secret Scan, Unit Tests & Golden Evals
+    runs-on: ubuntu-latest
+    env:
+      GOOGLE_CLOUD_PROJECT: ci-test-project
+      GOOGLE_CLOUD_LOCATION: us-central1
+      TRAVEL_PAYMENT_GATEWAY_TOKEN: ci-ephemeral-test-token-placeholder
+      ENABLE_CLOUD_TRACE: "false"
+      ENABLE_CLOUD_DLP: "false"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install package and dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Scan repository for leaked secrets or private keys
+        run: |
+          python - << 'EOF'
+          import pathlib
+          import re
+          import sys
+
+          root = pathlib.Path(".")
+          secret_patterns = [
+              ("Google API Key", re.compile(r"A[I]za[0-9A-Za-z\-_]{25,}")),
+              ("API Secret Key", re.compile(r"\bs[k]-[0-9A-Za-z]{20,}")),
+              ("Private Key PEM", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+          ]
+          violations = []
+          for path in root.rglob("*"):
+              if not path.is_file() or any(p in path.parts for p in (".git", ".venv", "__pycache__")):
+                  continue
+              text = path.read_text(encoding="utf-8", errors="ignore")
+              for label, pattern in secret_patterns:
+                  if pattern.search(text):
+                      violations.append(f"{path}: matched {label}")
+          if violations:
+              raise SystemExit("Secret scan failed:\n" + "\n".join(violations))
+          sys.stdout.write("Secret scan passed with zero findings.\n")
+          EOF
+
+      - name: Lint source, tests, and evaluation harness with Ruff
+        run: ruff check travel_concierge tests evals
+
+      - name: Run unit test suite with pytest
+        run: pytest -v
+
+      - name: Run Golden Dataset Evaluation & Regression Gate
+        run: |
+          python evals/run_evals.py \
+            --dataset evals/golden_dataset.evalset.json \
+            --config evals/test_config.json
+
+  terraform-validation:
+    name: Terraform Format & Schema Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.8.5"
+
+      - name: Verify Terraform HCL formatting
+        run: terraform -chdir=terraform fmt -check -recursive
+
+      - name: Initialize Terraform providers (backend disabled)
+        run: terraform -chdir=terraform init -backend=false
+
+      - name: Validate Terraform configuration
+        run: terraform -chdir=terraform validate
